@@ -1,17 +1,27 @@
 {
-  "name": "sol-copytrade-signal-bot",
+  "name": "solana-copy-trading-bot",
   "version": "1.0.0",
-  "description": "Solana copy-trade signal bot with pre-call filters and post-call tracking",
-  "type": "module",
+  "description": "Monitor Solana wallet and send buy signals to Telegram",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.95.3",
-    "dotenv": "^16.4.5"
+    "@solana/web3.js": "^1.87.6",
+    "axios": "^1.6.2",
+    "ws": "^8.14.2"
   },
   "engines": {
-    "node": ">=18"
-  }
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "solana",
+    "copy-trading",
+    "telegram-bot",
+    "pump-fun",
+    "raydium"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
 }
