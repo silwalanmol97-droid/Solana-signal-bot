@@ -2,64 +2,70 @@
 const WebSocket = require('ws');
 const axios = require('axios');
 const { Connection, PublicKey } = require('@solana/web3.js');
+const http = require('http');
 
-// Environment variables (Railway will provide these)
+// Environment variables
 const HELIUS_RPC_URL = process.env.HELIUS_RPC_URL;
 const WALLET_TO_MONITOR = process.env.WALLET_ADDRESS || 'pau23UpU2BFwF4JZrLxAnf4ZqgnD3xLnz6ESu7vPsao';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const DEXSCREENER_API = 'https://api.dexscreener.com/latest/dex';
 const PORT = process.env.PORT || 3000;
 
-if (!HELIUS_RPC_URL || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-  throw new Error('Missing required environment variables. Check Railway dashboard.');
+// Validate environment
+if (!HELIUS_RPC_URL) {
+  console.error('❌ Missing HELIUS_RPC_URL');
+  process.exit(1);
 }
 
-console.log(`🔍 Monitoring wallet: ${WALLET_TO_MONITOR}`);
-console.log(`📡 Helius RPC: ${HELIUS_RPC_URL.substring(0, 30)}...`);
+if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+  console.error('❌ Missing Telegram credentials');
+  process.exit(1);
+}
 
-// State management
+console.log('🚀 Starting Solana Copy Trading Bot...');
+console.log(`🔍 Monitoring: ${WALLET_TO_MONITOR}`);
+
+// State
 const trackedTokens = new Map();
 const signalHistory = [];
 let signalCount = 0;
 
-// Solana connection
-const connection = new Connection(HELIUS_RPC_URL, {
-  wsEndpoint: HELIUS_RPC_URL.replace('https', 'wss').replace('http', 'ws')
-});
+// Connection
+const solanaRpcUrl = HELIUS_RPC_URL.replace('wss', 'https').replace('ws', 'https');
+const connection = new Connection(solanaRpcUrl, { commitment: 'confirmed' });
 
-// Helper: Send Telegram message
-async function sendTelegram(message, parseMode = 'Markdown') {
+// Telegram
+async function sendTelegram(message) {
   try {
-    await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    await axios.post(url, {
       chat_id: TELEGRAM_CHAT_ID,
       text: message,
-      parse_mode: parseMode,
+      parse_mode: 'Markdown',
       disable_web_page_preview: true
     });
-    console.log('✅ Telegram message sent');
+    console.log('✅ Telegram sent');
   } catch (err) {
-    console.error('❌ Telegram error:', err.response?.data || err.message);
+    console.error('❌ Telegram error:', err.response?.data?.description || err.message);
   }
 }
 
-// Helper: Fetch token info from DexScreener
-async function getTokenInfo(mintAddress) {
+// DexScreener
+async function getTokenInfo(mint) {
   try {
-    const url = `${DEXSCREENER_API}/solana/tokens/${mintAddress}`;
-    const res = await axios.get(url, { timeout: 5000 });
+    const res = await axios.get(`https://api.dexscreener.com/latest/dex/solana/tokens/${mint}`, { 
+      timeout: 5000 
+    });
     return res.data;
   } catch (err) {
-    console.error('DexScreener fetch error:', err.message);
     return null;
   }
 }
 
-// Helper: Get market cap and volume
-async function getMarketData(mintAddress) {
-  const data = await getTokenInfo(mintAddress);
-  if (!data || !data.token) {
-    return { marketCap: 0, volume24h: 0, price: 0 };
+async function getMarketData(mint) {
+  const data = await getTokenInfo(mint);
+  if (!data?.token) {
+    return { marketCap: 0, volume24h: 0, price: 0, volume5m: 0 };
   }
   
   return {
@@ -70,151 +76,113 @@ async function getMarketData(mintAddress) {
   };
 }
 
-// Helper: Check Trench API
-async function checkTrench(mintAddress) {
+// Filters
+async function checkTrench(mint) {
   try {
-    const url = `https://trench.bot/api/bundle/advanced/${mintAddress}`;
-    const res = await axios.get(url, { timeout: 5000 });
-    const data = res.data;
+    const res = await axios.get(`https://trench.bot/api/bundle/advanced/${mint}`, { timeout: 5000 });
+    const { bundle_hold_percent = 0, insider_hold_percent = 0 } = res.data || {};
     
-    const bundleHoldPercent = data.bundle_hold_percent || 0;
-    const insiderHoldPercent = data.insider_hold_percent || 0;
-    
-    if (bundleHoldPercent >= 30 || insiderHoldPercent >= 25) {
-      return { 
-        pass: false, 
-        reason: `Trench: bundle ${bundleHoldPercent}%, insider ${insiderHoldPercent}%` 
-      };
+    if (bundle_hold_percent >= 30 || insider_hold_percent >= 25) {
+      return { pass: false, reason: `Trench: bundle ${bundle_hold_percent}%, insider ${insider_hold_percent}%` };
     }
     return { pass: true };
   } catch (err) {
-    console.error('Trench API error:', err.message);
+    console.error('Trench error:', err.message);
     return { pass: true };
   }
 }
 
-// Helper: Get top token holders via Helius
-async function getTopHolders(mintAddress) {
+async function checkHolders(mint) {
   try {
-    const url = `${HELIUS_RPC_URL.replace('wss', 'https').replace('ws', 'https')}`;
+    const url = solanaRpcUrl;
     const response = await axios.post(url, {
       jsonrpc: '2.0',
       id: 1,
       method: 'getTokenLargestAccounts',
-      params: [mintAddress]
+      params: [mint]
     }, {
-      headers: { 'Content-Type': 'application/json' }
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 5000
     });
     
     const accounts = response.data.result?.value || [];
-    return accounts.slice(0, 10).map(acc => ({
-      owner: acc.address,
-      amount: acc.amount,
-      percent: (acc.amount / 1e9) * 100 // Simplified
-    }));
-  } catch (err) {
-    console.error('Get holders error:', err.message);
-    return [];
-  }
-}
-
-// Helper: Check holder conditions
-async function checkHolders(mintAddress) {
-  try {
-    const holders = await getTopHolders(mintAddress);
+    const top10 = accounts.slice(0, 10);
     
-    if (holders.length < 2) {
-      return { pass: true };
-    }
+    if (top10.length < 2) return { pass: true };
     
-    // Check if both top 2 hold 5%+
-    const top2BothLarge = holders[0].percent >= 5 && holders[1].percent >= 5;
-    if (top2BothLarge) {
+    // Top 2 both 5%+
+    const p0 = top10[0].amount / 1e9;
+    const p1 = top10[1].amount / 1e9;
+    if (p0 >= 5 && p1 >= 5) {
       return { pass: false, reason: 'Top 2 holders both 5%+' };
     }
     
-    // Check SOL balances
+    // SOL balances
     let totalSOL = 0;
-    let walletsOver0_5 = 0;
+    let over0_5 = 0;
     
-    for (let i = 0; i < Math.min(10, holders.length); i++) {
+    for (let i = 0; i < Math.min(10, top10.length); i++) {
       try {
-        const wallet = new PublicKey(holders[i].owner);
+        const wallet = new PublicKey(top10[i].address);
         const balance = await connection.getBalance(wallet);
-        const solBalance = balance / 1e9;
-        totalSOL += solBalance;
-        if (solBalance >= 0.5) walletsOver0_5++;
-      } catch (err) {
-        // Skip if balance check fails
+        const sol = balance / 1e9;
+        totalSOL += sol;
+        if (sol >= 0.5) over0_5++;
+      } catch (e) {
+        // skip
       }
     }
     
-    if (totalSOL < 10 || walletsOver0_5 < 4) {
-      return { 
-        pass: false, 
-        reason: `SOL: ${totalSOL.toFixed(2)} SOL total, ${walletsOver0_5} wallets >=0.5 SOL` 
-      };
+    if (totalSOL < 10 || over0_5 < 4) {
+      return { pass: false, reason: `SOL: ${totalSOL.toFixed(1)} total, ${over0_5} >=0.5` };
     }
     
     return { pass: true };
   } catch (err) {
-    console.error('Holder check error:', err.message);
+    console.error('Holders error:', err.message);
     return { pass: true };
   }
 }
 
-// Pre-call filters
-async function applyPreCallFilters(mintAddress) {
-  const marketData = await getMarketData(mintAddress);
+async function applyFilters(mint) {
+  const marketData = await getMarketData(mint);
   
-  // Market cap filter
+  // MC filter
   if (marketData.marketCap < 50000 || marketData.marketCap > 350000) {
-    return { 
-      pass: false, 
-      reason: `MC $${marketData.marketCap.toLocaleString()} outside $50K-$350K range` 
-    };
+    return { pass: false, reason: `MC $${marketData.marketCap.toLocaleString()} outside range` };
   }
   
   // Volume filter
-  const volume5m = marketData.volume5m || (marketData.volume24h / 288); // Estimate
-  if (volume5m < 10000) {
-    return { 
-      pass: false, 
-      reason: `5m volume $${volume5m.toLocaleString()} below $10K` 
-    };
+  const vol5m = marketData.volume5m || (marketData.volume24h / 288);
+  if (vol5m < 10000) {
+    return { pass: false, reason: `5m vol $${vol5m.toLocaleString()} < $10K` };
   }
   
-  // Trench check
-  const trenchCheck = await checkTrench(mintAddress);
-  if (!trenchCheck.pass) {
-    return trenchCheck;
-  }
+  // Trench
+  const trench = await checkTrench(mint);
+  if (!trench.pass) return trench;
   
-  // Holder check
-  const holderCheck = await checkHolders(mintAddress);
-  if (!holderCheck.pass) {
-    return holderCheck;
-  }
+  // Holders
+  const holders = await checkHolders(mint);
+  if (!holders.pass) return holders;
   
   return { pass: true, marketData };
 }
 
-// Process new token purchase
-async function processNewToken(mintAddress, txSignature) {
+// Process token
+async function processToken(mint, tx) {
   console.log(`
-🔔 New token detected: ${mintAddress}`);
-  console.log(`Transaction: https://solscan.io/tx/${txSignature}`);
+🔔 New token: ${mint}`);
   
-  // Apply pre-call filters immediately
-  const filters = await applyPreCallFilters(mintAddress);
+  const filters = await applyFilters(mint);
   
   if (!filters.pass) {
-    console.log(`❌ Filter failed: ${filters.reason}`);
+    console.log(`❌ Filter: ${filters.reason}`);
     await sendTelegram(
       `❌ SKIPPED
 
 ` +
-      `Token: `${mintAddress}`
+      `Token: `${mint}`
 ` +
       `Reason: ${filters.reason}
 ` +
@@ -223,180 +191,153 @@ async function processNewToken(mintAddress, txSignature) {
     return;
   }
   
-  const marketData = filters.marketData;
+  const md = filters.marketData;
   
-  // Send buy signal
-  const message = 
-    `🚀 *BUY SIGNAL* 🚀
+  // Send signal
+  const msg = 
+    `🚀 *BUY SIGNAL*
 
 ` +
-    `🪙 Token: `${mintAddress}`
+    `🪙 Token: `${mint}`
 ` +
-    `💰 Price: $${marketData.price}
+    `💰 Price: $${md.price}
 ` +
-    `📊 Market Cap: $${marketData.marketCap.toLocaleString()}
+    `📊 MC: $${md.marketCap.toLocaleString()}
 ` +
-    `📈 24h Volume: $${marketData.volume24h.toLocaleString()}
+    `📈 Vol24h: $${md.volume24h.toLocaleString()}
 ` +
-    `🔗 TX: [Solscan](https://solscan.io/tx/${txSignature})
+    `🔗 TX: [Solscan](https://solscan.io/tx/${tx})
 ` +
-    `⏰ Time: ${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Melbourne' })}
+    `⏰ ${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Melbourne' })}
 
 ` +
-    `⚠️ *DYOR - Not financial advice*`;
+    `⚠️ DYOR`;
   
-  await sendTelegram(message);
+  await sendTelegram(msg);
   
-  // Track signal
+  // Track
   signalCount++;
-  const signalData = {
-    mint: mintAddress,
-    tx: txSignature,
-    entryMC: marketData.marketCap,
-    entryPrice: marketData.price,
+  const data = {
+    mint,
+    tx,
+    entryMC: md.marketCap,
+    entryPrice: md.price,
     timestamp: Date.now(),
-    peakMC: marketData.marketCap,
-    lowMC: marketData.marketCap,
+    peakMC: md.marketCap,
+    lowMC: md.marketCap,
     mc80min: null,
     rugAlertSent: false
   };
   
-  trackedTokens.set(mintAddress, signalData);
-  signalHistory.push(signalData);
+  trackedTokens.set(mint, data);
+  signalHistory.push(data);
   
-  // Start post-signal tracking
-  trackPostSignal(mintAddress);
+  // Track post
+  trackPost(mint);
   
-  console.log(`✅ Signal #${signalCount} sent for ${mintAddress}`);
+  console.log(`✅ Signal #${signalCount}`);
 }
 
-// Track post-signal performance
-async function trackPostSignal(mintAddress) {
-  const tokenData = trackedTokens.get(mintAddress);
+async function trackPost(mint) {
+  const tokenData = trackedTokens.get(mint);
   if (!tokenData) return;
   
-  const startTime = Date.now();
-  const eightyMinutes = 80 * 60 * 1000;
-  let checkCount = 0;
+  const start = Date.now();
+  const eightyMin = 80 * 60 * 1000;
   
   const interval = setInterval(async () => {
-    const marketData = await getMarketData(mintAddress);
-    const currentMC = marketData.marketCap;
+    const md = await getMarketData(mint);
+    const mc = md.marketCap;
     
-    if (currentMC > 0) {
-      // Update peak
-      if (currentMC > tokenData.peakMC) {
-        tokenData.peakMC = currentMC;
-      }
+    if (mc > 0) {
+      if (mc > tokenData.peakMC) tokenData.peakMC = mc;
+      if (mc < tokenData.lowMC) tokenData.lowMC = mc;
       
-      // Update low
-      if (currentMC < tokenData.lowMC) {
-        tokenData.lowMC = currentMC;
-      }
-      
-      // Check for rug (-90% from entry)
+      // Rug check
       if (!tokenData.rugAlertSent && tokenData.entryMC > 0) {
-        const dropPercent = ((tokenData.entryMC - currentMC) / tokenData.entryMC) * 100;
-        if (dropPercent >= 90) {
+        const drop = ((tokenData.entryMC - mc) / tokenData.entryMC) * 100;
+        if (drop >= 90) {
           await sendTelegram(
-            `🚨 *RUG ALERT* 🚨
+            `🚨 *RUG ALERT*
 
 ` +
-            `🪙 Token: `${mintAddress}`
+            `🪙 `${mint}`
 ` +
-            `📉 Drop: ${dropPercent.toFixed(2)}%
+            `📉 -${drop.toFixed(2)}%
 ` +
-            `💰 Entry MC: $${tokenData.entryMC.toLocaleString()}
+            `Entry: $${tokenData.entryMC.toLocaleString()}
 ` +
-            `💸 Current MC: $${currentMC.toLocaleString()}
-` +
-            `⏰ Time: ${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Melbourne' })}`
+            `Now: $${mc.toLocaleString()}`
           );
           tokenData.rugAlertSent = true;
         }
       }
     }
     
-    checkCount++;
-    
-    // Check if 80 minutes passed
-    if (Date.now() - startTime >= eightyMinutes) {
-      tokenData.mc80min = currentMC;
+    if (Date.now() - start >= eightyMin) {
+      tokenData.mc80min = mc;
+      console.log(`📊 80min done: ${mint}`);
       
-      console.log(`📊 80min complete for ${mintAddress}: Peak $${tokenData.peakMC.toLocaleString()}, Low $${tokenData.lowMC.toLocaleString()}, 80min $${currentMC.toLocaleString()}`);
-      
-      // Send batch report if we have 3+ completed signals
-      const completedSignals = signalHistory.filter(s => s.mc80min !== null);
-      if (completedSignals.length >= 3 && completedSignals.length % 3 === 0) {
-        await sendBatchReport(completedSignals.slice(-3));
+      const completed = signalHistory.filter(s => s.mc80min !== null);
+      if (completed.length >= 3 && completed.length % 3 === 0) {
+        await sendBatchReport(completed.slice(-3));
       }
       
-      // Clean up
-      trackedTokens.delete(mintAddress);
+      trackedTokens.delete(mint);
       clearInterval(interval);
     }
-  }, 60000); // Check every minute
-  
-  console.log(`📡 Started tracking ${mintAddress} for 80 minutes`);
+  }, 60000);
 }
 
-// Send batch report
 async function sendBatchReport(signals) {
-  let message = `📊 *BATCH REPORT* (Last 3 Signals)
+  let msg = `📊 *BATCH REPORT*
 
 `;
   
-  for (let i = 0; i < signals.length; i++) {
-    const s = signals[i];
+  signals.forEach((s, i) => {
     const roi = s.mc80min ? ((s.mc80min - s.entryMC) / s.entryMC * 100).toFixed(2) : 'N/A';
-    
-    message += `${i + 1}. `${s.mint.substring(0, 8)}...${s.mint.substring(s.mint.length - 8)}`
+    msg += `${i + 1}. `${s.mint.slice(0, 8)}...${s.mint.slice(-8)}`
 `;
-    message += `   Entry: $${s.entryMC.toLocaleString()} | Peak: $${s.peakMC.toLocaleString()}
+    msg += `   Entry: $${s.entryMC.toLocaleString()} | Peak: $${s.peakMC.toLocaleString()}
 `;
-    message += `   Low: $${s.lowMC.toLocaleString()} | 80min: $${s.mc80min ? s.mc80min.toLocaleString() : 'N/A'}
+    msg += `   Low: $${s.lowMC.toLocaleString()} | 80min: $${s.mc80min ? s.mc80min.toLocaleString() : 'N/A'}
 `;
-    message += `   ROI: ${roi}% | Rug: ${s.rugAlertSent ? 'YES ⚠️' : 'NO'}
+    msg += `   ROI: ${roi}% | Rug: ${s.rugAlertSent ? 'YES ⚠️' : 'NO'}
 
 `;
-  }
+  });
   
-  message += `⏰ Report Time: ${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Melbourne' })}`;
-  
-  await sendTelegram(message);
+  await sendTelegram(msg);
 }
 
-// Parse transaction logs for token mint/purchase
-function extractTokenMintFromLogs(logs, walletAddress) {
+// Extract mint from logs
+function extractMint(logs, wallet) {
   try {
-    // Look for initializeMint or similar instructions
     for (const log of logs) {
-      if (log.includes('initializeMint') || log.includes('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')) {
-        // Extract mint address from log (simplified)
+      if (log.includes('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')) {
         const parts = log.split(' ');
         for (const part of parts) {
-          if (part.length === 44 && part !== walletAddress) {
+          if (part.length === 44 && part !== wallet) {
             return part;
           }
         }
       }
     }
-  } catch (err) {
-    console.error('Log parsing error:', err.message);
+  } catch (e) {
+    // ignore
   }
   return null;
 }
 
-// Subscribe to wallet activity using Helius enhanced API
-async function subscribeToWallet() {
+// WebSocket
+async function subscribeWallet() {
   const wsUrl = HELIUS_RPC_URL.replace('https', 'wss').replace('http', 'ws');
   const ws = new WebSocket(wsUrl);
   
   ws.on('open', () => {
-    console.log('✅ Connected to Helius WebSocket');
+    console.log('✅ WebSocket connected');
     
-    // Subscribe to wallet logs
-    const subscription = {
+    const sub = {
       jsonrpc: '2.0',
       id: 1,
       method: 'logsSubscribe',
@@ -406,7 +347,7 @@ async function subscribeToWallet() {
       ]
     };
     
-    ws.send(JSON.stringify(subscription));
+    ws.send(JSON.stringify(sub));
   });
   
   ws.on('message', async (data) => {
@@ -416,46 +357,41 @@ async function subscribeToWallet() {
       if (parsed.params?.result?.value) {
         const value = parsed.params.result.value;
         const logs = value.logs || [];
-        const signature = value.signature;
+        const sig = value.signature;
         
-        // Check for pump.fun or Raydium interactions
-        const isPumpOrRaydium = logs.some(log => 
+        const isTarget = logs.some(log => 
           log.toLowerCase().includes('pump') || 
           log.toLowerCase().includes('raydium') ||
-          log.includes('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8') // Raydium program
+          log.includes('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8')
         );
         
-        if (isPumpOrRaydium) {
-          console.log('🔍 Detected pump.fun/Raydium interaction');
-          console.log('Logs:', logs.slice(0, 5));
+        if (isTarget) {
+          console.log('🔍 Detected interaction');
+          const mint = extractMint(logs, WALLET_TO_MONITOR);
           
-          // Extract token mint
-          const mintAddress = extractTokenMintFromLogs(logs, WALLET_TO_MONITOR);
-          
-          if (mintAddress) {
-            await processNewToken(mintAddress, signature);
+          if (mint) {
+            await processToken(mint, sig);
           } else {
-            console.log('⚠️ Could not extract mint address from logs');
+            console.log('⚠️ No mint extracted');
           }
         }
       }
     } catch (err) {
-      console.error('WebSocket message error:', err.message);
+      console.error('WS error:', err.message);
     }
   });
   
   ws.on('error', (err) => {
-    console.error('❌ WebSocket error:', err.message);
+    console.error('❌ WS error:', err.message);
   });
   
   ws.on('close', () => {
-    console.log('⚠️ WebSocket closed, reconnecting...');
-    setTimeout(subscribeToWallet, 5000);
+    console.log('⚠️ WS closed, reconnecting...');
+    setTimeout(subscribeWallet, 5000);
   });
 }
 
-// Health check endpoint for Railway
-const http = require('http');
+// HTTP server
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -468,18 +404,16 @@ const server = http.createServer((req, res) => {
     }));
   } else {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Solana Copy Trading Bot is running! 🚀');
+    res.end('Bot running! 🚀');
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/health`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server on port ${PORT}`);
+  console.log(`📊 Health: http://localhost:${PORT}/health`);
   
-  // Start WebSocket subscription
-  subscribeToWallet();
+  subscribeWallet();
   
-  // Send startup notification
   setTimeout(async () => {
     await sendTelegram(
       `✅ *Bot Started*
@@ -487,12 +421,9 @@ server.listen(PORT, () => {
 ` +
       `🔍 Monitoring: `${WALLET_TO_MONITOR}`
 ` +
-      `📡 Railway Deployment: Active
+      `📡 Railway: Active
 ` +
-      `⏰ Time: ${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Melbourne' })}
-
-` +
-      `You will receive signals when this wallet buys tokens on pump.fun or Raydium.`
+      `⏰ ${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Melbourne' })}`
     );
   }, 2000);
 });
