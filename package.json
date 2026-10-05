@@ -1,0 +1,17 @@
+{
+  "name": "solana-copy-trading-bot",
+  "version": "1.0.0",
+  "description": "Monitor Solana wallet and send buy signals to Telegram",
+  "main": "Index.js",
+  "scripts": {
+    "start": "node Index.js"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.87.6",
+    "axios": "^1.6.2",
+    "ws": "^8.14.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
